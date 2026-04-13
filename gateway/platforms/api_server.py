@@ -25,7 +25,9 @@ import hashlib
 import hmac
 import json
 import logging
+import mimetypes
 import os
+from pathlib import Path
 import socket as _socket
 import re
 import sqlite3
@@ -611,6 +613,172 @@ class APIServerAdapter(BasePlatformAdapter):
                 }
             ],
         })
+
+    def _miniapp_index_path(self) -> Path:
+        try:
+            from hermes_constants import get_hermes_home
+            return get_hermes_home() / "miniapp" / "index.html"
+        except Exception:
+            return Path.home() / ".hermes" / "miniapp" / "index.html"
+
+    def _current_model_info(self) -> Dict[str, Any]:
+        from gateway.run import _load_gateway_config, _resolve_runtime_agent_kwargs
+
+        cfg = _load_gateway_config() or {}
+        runtime = _resolve_runtime_agent_kwargs()
+        model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+        context_length = 0
+        if isinstance(model_cfg, dict):
+            try:
+                context_length = int(model_cfg.get("context_length") or 0)
+            except Exception:
+                context_length = 0
+        model_name = self._model_name or "hermes-agent"
+        model_short = model_name.split("/")[-1] if "/" in model_name else model_name
+        provider = runtime.get("provider") or (model_cfg.get("provider") if isinstance(model_cfg, dict) else None) or "unknown"
+        return {
+            "model": model_name,
+            "model_short": model_short,
+            "provider": provider,
+            "context_length": context_length,
+        }
+
+    async def _handle_model_info(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response(self._current_model_info())
+
+    async def _handle_session_usage(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response({
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        })
+
+    async def _handle_commands(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from hermes_cli.commands import COMMAND_REGISTRY
+        commands = []
+        for cmd in COMMAND_REGISTRY:
+            commands.append({
+                "name": cmd.name,
+                "description": cmd.description,
+                "category": cmd.category,
+                "aliases": list(cmd.aliases),
+                "args_hint": cmd.args_hint,
+                "cli_only": bool(cmd.cli_only),
+                "gateway_only": bool(cmd.gateway_only),
+            })
+        return web.json_response({"commands": commands})
+
+    async def _handle_command(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        raw_command = str(body.get("command") or "").strip()
+        args = str(body.get("args") or "").strip()
+        command = raw_command.lstrip("/").lower()
+        model_info = self._current_model_info()
+
+        if command in {"help", "commands"}:
+            from hermes_cli.commands import COMMAND_REGISTRY
+            output = "Available commands:\n" + "\n".join(
+                f"/{cmd.name} {cmd.args_hint}".rstrip() for cmd in COMMAND_REGISTRY
+            )
+            return web.json_response({"output": output})
+
+        if command == "status":
+            output = (
+                f"Model: {model_info['model']}\n"
+                f"Provider: {model_info['provider']}\n"
+                f"Context length: {model_info['context_length'] or 'unknown'}\n"
+                f"API server: http://{self._host}:{self._port}"
+            )
+            return web.json_response({"output": output})
+
+        if command == "profile":
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                profile_name = get_active_profile_name() or "default"
+            except Exception:
+                profile_name = "default"
+            try:
+                from hermes_constants import get_hermes_home
+                home_dir = str(get_hermes_home())
+            except Exception:
+                home_dir = str(Path.home() / ".hermes")
+            return web.json_response({"output": f"Profile: {profile_name}\nHome: {home_dir}"})
+
+        if command == "cron" and args.startswith("list"):
+            jobs_response = await self._handle_list_jobs(request)
+            if getattr(jobs_response, "status", 200) >= 400:
+                return jobs_response
+            jobs_payload = json.loads(jobs_response.text)
+            jobs = jobs_payload.get("jobs") or []
+            if not jobs:
+                return web.json_response({"output": "No cron jobs configured."})
+            lines = []
+            for job in jobs[:20]:
+                lines.append(f"- {job.get('name') or job.get('id')}: {job.get('schedule_display') or job.get('schedule', {}).get('display', '')}")
+            return web.json_response({"output": "Cron jobs:\n" + "\n".join(lines)})
+
+        return web.json_response({
+            "output": f"Miniapp command API does not support /{command}{(' ' + args) if args else ''} yet. Use normal chat for now.",
+        })
+
+    async def _handle_processes(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response({"processes": []})
+
+    async def _handle_agents_list(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response({"agents": []})
+
+    async def _handle_agents_create(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response({"error": "Agent spawning is not wired into this Hermes build yet."}, status=501)
+
+    async def _handle_agents_get(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response({"error": "Unknown agent"}, status=404)
+
+    async def _handle_agents_delete(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response({"error": "Unknown agent"}, status=404)
+
+    async def _handle_agents_message(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response({"error": "Agent messaging is not wired into this Hermes build yet."}, status=501)
+
+    async def _handle_miniapp(self, request: "web.Request") -> "web.StreamResponse":
+        miniapp_path = self._miniapp_index_path()
+        if not miniapp_path.exists():
+            return web.json_response({"error": f"Mini app not found at {miniapp_path}"}, status=404)
+        return web.FileResponse(path=miniapp_path)
+
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -2317,6 +2485,19 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
+            self._app.router.add_get("/miniapp", self._handle_miniapp)
+            self._app.router.add_get("/miniapp/", self._handle_miniapp)
+            self._app.router.add_get("/miniapp/index.html", self._handle_miniapp)
+            self._app.router.add_get("/api/model-info", self._handle_model_info)
+            self._app.router.add_get("/api/session-usage", self._handle_session_usage)
+            self._app.router.add_get("/api/commands", self._handle_commands)
+            self._app.router.add_post("/api/command", self._handle_command)
+            self._app.router.add_get("/api/processes", self._handle_processes)
+            self._app.router.add_get("/api/agents", self._handle_agents_list)
+            self._app.router.add_post("/api/agents", self._handle_agents_create)
+            self._app.router.add_get("/api/agents/{name}", self._handle_agents_get)
+            self._app.router.add_delete("/api/agents/{name}", self._handle_agents_delete)
+            self._app.router.add_post("/api/agents/{name}/message", self._handle_agents_message)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
