@@ -25,13 +25,13 @@ import hashlib
 import hmac
 import json
 import logging
-import mimetypes
 import os
 from pathlib import Path
 import socket as _socket
 import re
 import sqlite3
 import time
+import urllib.parse
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -467,14 +467,79 @@ class APIServerAdapter(BasePlatformAdapter):
     # Auth helper
     # ------------------------------------------------------------------
 
+    def _parse_allowed_telegram_ids(self) -> set[str]:
+        allowed: set[str] = set()
+        owner = os.getenv("TELEGRAM_OWNER_ID", "").strip()
+        if owner:
+            allowed.add(owner)
+        raw_allowed = os.getenv("TELEGRAM_ALLOWED_USERS", "")
+        for part in raw_allowed.split(","):
+            part = part.strip()
+            if part:
+                allowed.add(part)
+        return allowed
+
+    def _validate_telegram_init_data(self, init_data: str) -> bool:
+        if not init_data:
+            return False
+        bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        if not bot_token:
+            return False
+
+        try:
+            pairs = urllib.parse.parse_qsl(init_data, keep_blank_values=True)
+        except Exception:
+            return False
+        if not pairs:
+            return False
+
+        data = dict(pairs)
+        their_hash = data.pop("hash", "")
+        if not their_hash:
+            return False
+
+        auth_date_raw = data.get("auth_date", "")
+        try:
+            auth_date = int(auth_date_raw)
+        except Exception:
+            return False
+        # Keep replay window tight for miniapp auth.
+        if abs(int(time.time()) - auth_date) > 300:
+            return False
+
+        user_raw = data.get("user", "")
+        if not user_raw:
+            return False
+        try:
+            user_obj = json.loads(user_raw)
+        except Exception:
+            return False
+        user_id = str(user_obj.get("id") or "").strip()
+        if not user_id:
+            return False
+
+        allowed_ids = self._parse_allowed_telegram_ids()
+        if allowed_ids and user_id not in allowed_ids:
+            return False
+
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+        secret_key = hmac.new(b"WebAppData", bot_token.encode("utf-8"), hashlib.sha256).digest()
+        calc_hash = hmac.new(secret_key, data_check_string.encode("utf-8"), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(calc_hash, their_hash)
+
     def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
         """
-        Validate Bearer token from Authorization header.
+        Validate auth from either Telegram Mini App initData or Bearer token.
 
-        Returns None if auth is OK, or a 401 web.Response on failure.
-        If no API key is configured, all requests are allowed (only when API
-        server is local).
+        Order:
+        1. Valid Telegram Mini App initData header
+        2. Bearer token
+        3. If no API key configured, allow local-only use
         """
+        telegram_init_data = request.headers.get("X-Telegram-Init-Data", "").strip()
+        if telegram_init_data and self._validate_telegram_init_data(telegram_init_data):
+            return None
+
         if not self._api_key:
             return None  # No key configured — allow all (local-only use)
 
