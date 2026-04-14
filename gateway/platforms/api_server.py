@@ -237,7 +237,7 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-Telegram-Init-Data",
 }
 
 
@@ -249,7 +249,8 @@ if AIOHTTP_AVAILABLE:
         origin = request.headers.get("Origin", "")
         cors_headers = None
         if adapter is not None:
-            if not adapter._origin_allowed(origin):
+            same_origin = adapter._request_is_same_origin(request, origin)
+            if origin and not same_origin and not adapter._origin_allowed(origin):
                 return web.Response(status=403)
             cors_headers = adapter._cors_headers_for_origin(origin)
 
@@ -462,6 +463,45 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         return "*" in self._cors_origins or origin in self._cors_origins
+
+    @staticmethod
+    def _request_is_same_origin(request: "web.Request", origin: str) -> bool:
+        """Treat same-host browser requests as safe even when CORS allowlist is empty."""
+        if not origin:
+            return True
+
+        try:
+            parsed = urllib.parse.urlparse(origin)
+        except Exception:
+            return False
+
+        origin_netloc = (parsed.netloc or "").lower()
+        if not origin_netloc:
+            return False
+
+        host_candidates = [
+            request.headers.get("X-Forwarded-Host", ""),
+            request.headers.get("Host", ""),
+            request.host or "",
+        ]
+        host_candidates = [h.strip().lower() for h in host_candidates if h and h.strip()]
+        if origin_netloc in host_candidates:
+            return True
+
+        origin_host = (parsed.hostname or "").lower()
+        if not origin_host:
+            return False
+
+        def _strip_default_port(value: str) -> str:
+            if value.endswith(":80"):
+                return value[:-3]
+            if value.endswith(":443"):
+                return value[:-4]
+            return value
+
+        normalized_candidates = {_strip_default_port(h) for h in host_candidates}
+        normalized_candidates.update({h.split(":", 1)[0] for h in normalized_candidates})
+        return origin_host in normalized_candidates
 
     # ------------------------------------------------------------------
     # Auth helper

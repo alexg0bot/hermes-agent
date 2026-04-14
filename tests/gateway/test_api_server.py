@@ -1781,6 +1781,36 @@ class TestCORS:
             assert resp.headers.get("Access-Control-Allow-Origin") is None
 
     @pytest.mark.asyncio
+    async def test_same_origin_browser_request_allowed_by_default(self, adapter):
+        """Same-origin browser requests should not require explicit CORS allowlist entries."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/health",
+                headers={
+                    "Origin": "http://127.0.0.1",
+                    "Host": "127.0.0.1",
+                },
+            )
+            assert resp.status == 200
+            assert resp.headers.get("Access-Control-Allow-Origin") is None
+
+    @pytest.mark.asyncio
+    async def test_same_origin_proxy_host_allowed_by_default(self, adapter):
+        """Same-host requests behind a TLS proxy should pass even if local scheme differs."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/health",
+                headers={
+                    "Origin": "https://hermes.alexland.com",
+                    "Host": "hermes.alexland.com",
+                },
+            )
+            assert resp.status == 200
+            assert resp.headers.get("Access-Control-Allow-Origin") is None
+
+    @pytest.mark.asyncio
     async def test_cors_options_preflight_rejected_by_default(self, adapter):
         """Browser preflight is rejected unless CORS is explicitly configured."""
         app = _create_app(adapter)
