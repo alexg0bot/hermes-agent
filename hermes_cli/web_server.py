@@ -25,6 +25,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import httpx
 import yaml
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
@@ -443,6 +444,43 @@ except (ValueError, TypeError):
         os.getenv("GATEWAY_HEALTH_TIMEOUT"),
     )
     _GATEWAY_HEALTH_TIMEOUT = 3.0
+
+
+def _normalize_gateway_base_url(url: str) -> str:
+    """Normalize a configured gateway URL to its bare scheme://host[:port] base."""
+    base = url.rstrip("/")
+    for suffix in ("/health/detailed", "/health", "/v1/chat/completions"):
+        if base.endswith(suffix):
+            return base[: -len(suffix)]
+    return base
+
+
+def _get_gateway_base_url() -> str:
+    """Return the Hermes API server base URL the dashboard should proxy to."""
+    if _GATEWAY_HEALTH_URL:
+        return _normalize_gateway_base_url(_GATEWAY_HEALTH_URL)
+    host = os.getenv("API_SERVER_HOST", "127.0.0.1")
+    port = os.getenv("API_SERVER_PORT", "8642")
+    scheme = "https" if host.startswith("https://") else "http"
+    if host.startswith(("http://", "https://")):
+        parsed = urllib.parse.urlsplit(host)
+        netloc = parsed.netloc or parsed.path
+        base = f"{parsed.scheme}://{netloc}"
+        if parsed.port is None and port:
+            return f"{base}:{port}"
+        return base.rstrip("/")
+    return f"{scheme}://{host}:{port}"
+
+
+def _get_gateway_api_key() -> str:
+    """Load the API server bearer token from the current env/.env."""
+    env = load_env()
+    return (
+        env.get("GATEWAY_PROXY_KEY", "")
+        or env.get("API_SERVER_KEY", "")
+        or os.getenv("GATEWAY_PROXY_KEY", "")
+        or os.getenv("API_SERVER_KEY", "")
+    )
 
 
 def _probe_gateway_health() -> tuple[bool, dict | None]:
@@ -2272,12 +2310,12 @@ async def get_usage_analytics(days: int = 30):
 #
 # The endpoint spawns the same ``hermes --tui`` binary the CLI uses, behind
 # a POSIX pseudo-terminal, and forwards bytes + resize escapes across a
-# WebSocket.  The browser renders the ANSI through xterm.js (see
+# WebSocket. The browser renders the ANSI through xterm.js (see
 # web/src/pages/ChatPage.tsx).
 #
 # Auth: ``?token=<session_token>`` query param (browsers can't set
-# Authorization on the WS upgrade).  Same ephemeral ``_SESSION_TOKEN`` as
-# REST.  Localhost-only — we defensively reject non-loopback clients even
+# Authorization on the WS upgrade). Same ephemeral ``_SESSION_TOKEN`` as
+# REST. Localhost-only — we defensively reject non-loopback clients even
 # though uvicorn binds to 127.0.0.1.
 # ---------------------------------------------------------------------------
 
@@ -2294,7 +2332,7 @@ _VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
 
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
-# and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
+# and /api/events (dashboard → browser sidebar). Keyed by an opaque channel id
 # the chat tab generates on mount; entries auto-evict when the last subscriber
 # drops AND the publisher has disconnected.
 _event_channels: dict[str, set] = {}
@@ -2307,7 +2345,7 @@ def _resolve_chat_argv(
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve the argv + cwd + env for the chat PTY.
 
-    Default: whatever ``hermes --tui`` would run.  Tests monkeypatch this
+    Default: whatever ``hermes --tui`` would run. Tests monkeypatch this
     function to inject a tiny fake command (``cat``, ``sh -c 'printf …'``)
     so nothing has to build Node or the TUI bundle.
 
@@ -2360,15 +2398,12 @@ async def _broadcast_event(channel: str, payload: str) -> None:
         try:
             await sub.send_text(payload)
         except Exception:
-            # Subscriber went away mid-send; the /api/events finally clause
-            # will remove it from the registry on its next iteration.
             pass
 
 
 def _channel_or_close_code(ws: WebSocket) -> Optional[str]:
     """Return the channel id from the query string or None if invalid."""
     channel = ws.query_params.get("channel", "")
-
     return channel if _VALID_CHANNEL_RE.match(channel) else None
 
 
@@ -2378,7 +2413,6 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    # --- auth + loopback check (before accept so we can close cleanly) ---
     token = ws.query_params.get("token", "")
     expected = _SESSION_TOKEN
     if not hmac.compare_digest(token.encode(), expected.encode()):
@@ -2392,7 +2426,6 @@ async def pty_ws(ws: WebSocket) -> None:
 
     await ws.accept()
 
-    # --- spawn PTY ------------------------------------------------------
     resume = ws.query_params.get("resume") or None
     channel = _channel_or_close_code(ws)
     sidecar_url = _build_sidecar_url(channel) if channel else None
@@ -2400,11 +2433,9 @@ async def pty_ws(ws: WebSocket) -> None:
     try:
         argv, cwd, env = _resolve_chat_argv(resume=resume, sidecar_url=sidecar_url)
     except SystemExit as exc:
-        # _make_tui_argv calls sys.exit(1) when node/npm is missing.
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
         return
-
 
     try:
         bridge = PtyBridge.spawn(argv, cwd=cwd, env=env)
@@ -2419,15 +2450,12 @@ async def pty_ws(ws: WebSocket) -> None:
 
     loop = asyncio.get_running_loop()
 
-    # --- reader task: PTY master → WebSocket ----------------------------
     async def pump_pty_to_ws() -> None:
         while True:
-            chunk = await loop.run_in_executor(
-                None, bridge.read, _PTY_READ_CHUNK_TIMEOUT
-            )
-            if chunk is None:  # EOF
+            chunk = await loop.run_in_executor(None, bridge.read, _PTY_READ_CHUNK_TIMEOUT)
+            if chunk is None:
                 return
-            if not chunk:  # no data this tick; yield control and retry
+            if not chunk:
                 await asyncio.sleep(0)
                 continue
             try:
@@ -2437,7 +2465,6 @@ async def pty_ws(ws: WebSocket) -> None:
 
     reader_task = asyncio.create_task(pump_pty_to_ws())
 
-    # --- writer loop: WebSocket → PTY master ----------------------------
     try:
         while True:
             msg = await ws.receive()
@@ -2451,7 +2478,6 @@ async def pty_ws(ws: WebSocket) -> None:
             if not raw:
                 continue
 
-            # Resize escape is consumed locally, never written to the PTY.
             match = _RESIZE_RE.match(raw)
             if match and match.end() == len(raw):
                 cols = int(match.group(1))
@@ -2473,12 +2499,6 @@ async def pty_ws(ws: WebSocket) -> None:
 
 # ---------------------------------------------------------------------------
 # /api/ws — JSON-RPC WebSocket sidecar for the dashboard "Chat" tab.
-#
-# Drives the same `tui_gateway.dispatch` surface Ink uses over stdio, so the
-# dashboard can render structured metadata (model badge, tool-call sidebar,
-# slash launcher, session info) alongside the xterm.js terminal that PTY
-# already paints. Both transports bind to the same session id when one is
-# active, so a tool.start emitted by the agent fans out to both sinks.
 # ---------------------------------------------------------------------------
 
 
@@ -2505,13 +2525,6 @@ async def gateway_ws(ws: WebSocket) -> None:
 
 # ---------------------------------------------------------------------------
 # /api/pub + /api/events — chat-tab event broadcast.
-#
-# The PTY-side ``tui_gateway.entry`` opens /api/pub at startup (driven by
-# HERMES_TUI_SIDECAR_URL set in /api/pty's PTY env) and writes every
-# dispatcher emit through it.  The dashboard fans those frames out to any
-# subscriber that opened /api/events on the same channel id.  This is what
-# gives the React sidebar its tool-call feed without breaking the PTY
-# child's stdio handshake with Ink.
 # ---------------------------------------------------------------------------
 
 
@@ -2573,21 +2586,89 @@ async def events_ws(ws: WebSocket) -> None:
 
     try:
         while True:
-            # Subscribers don't speak — the receive() just blocks until
-            # disconnect so the connection stays open as long as the
-            # browser holds it.
             await ws.receive_text()
     except WebSocketDisconnect:
         pass
     finally:
         async with _event_lock:
             subs = _event_channels.get(channel)
-
             if subs is not None:
                 subs.discard(ws)
-
                 if not subs:
                     _event_channels.pop(channel, None)
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions_proxy(request: Request):
+    """Proxy dashboard chat requests to the Hermes API server."""
+    _require_token(request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    upstream_headers: Dict[str, str] = {"Content-Type": "application/json"}
+    api_key = _get_gateway_api_key()
+    if api_key:
+        upstream_headers["Authorization"] = f"Bearer {api_key}"
+
+    session_id = request.headers.get("X-Hermes-Session-Id")
+    if session_id:
+        upstream_headers["X-Hermes-Session-Id"] = session_id
+
+    upstream_url = f"{_get_gateway_base_url()}/v1/chat/completions"
+    timeout = httpx.Timeout(300.0)
+
+    try:
+        if body.get("stream"):
+            from fastapi.responses import StreamingResponse
+
+            client = httpx.AsyncClient(timeout=timeout)
+            upstream_response = await client.send(
+                client.build_request("POST", upstream_url, json=body, headers=upstream_headers),
+                stream=True,
+            )
+            if upstream_response.is_error:
+                detail = (await upstream_response.aread()).decode("utf-8", errors="replace")
+                await upstream_response.aclose()
+                await client.aclose()
+                raise HTTPException(status_code=upstream_response.status_code, detail=detail)
+
+            async def _stream_chunks():
+                try:
+                    async for chunk in upstream_response.aiter_bytes():
+                        yield chunk
+                finally:
+                    await upstream_response.aclose()
+                    await client.aclose()
+
+            response_headers = {
+                "X-Accel-Buffering": "no",
+                "Cache-Control": "no-cache",
+            }
+            gateway_session_id = upstream_response.headers.get("X-Hermes-Session-Id")
+            if gateway_session_id:
+                response_headers["X-Hermes-Session-Id"] = gateway_session_id
+            return StreamingResponse(
+                _stream_chunks(),
+                media_type="text/event-stream",
+                headers=response_headers,
+            )
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(upstream_url, json=body, headers=upstream_headers)
+        response = JSONResponse(content=resp.json(), status_code=resp.status_code)
+        gateway_session_id = resp.headers.get("X-Hermes-Session-Id")
+        if gateway_session_id:
+            response.headers["X-Hermes-Session-Id"] = gateway_session_id
+        return response
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text if exc.response is not None else str(exc)
+        raise HTTPException(status_code=exc.response.status_code, detail=detail)
+    except httpx.HTTPError as exc:
+        _log.exception("Chat proxy error")
+        raise HTTPException(status_code=502, detail=f"Gateway error: {exc}")
 
 
 def mount_spa(application: FastAPI):

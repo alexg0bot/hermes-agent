@@ -345,6 +345,127 @@ class TestWebServerEndpoints:
         if resp.status_code == 200:
             assert "FastAPI" not in resp.text  # Should not serve the actual source
 
+    def test_chat_completions_proxy_forwards_non_streaming_requests(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        captured = {}
+
+        class _FakeResponse:
+            status_code = 200
+            headers = {"X-Hermes-Session-Id": "gw-session-123"}
+
+            def json(self):
+                return {"id": "chatcmpl-test", "choices": [{"message": {"role": "assistant", "content": "hello"}}]}
+
+        class _FakeAsyncClient:
+            def __init__(self, *args, **kwargs):
+                captured["timeout"] = kwargs.get("timeout")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, json=None, headers=None):
+                captured["url"] = url
+                captured["json"] = json
+                captured["headers"] = dict(headers or {})
+                return _FakeResponse()
+
+        monkeypatch.setattr(web_server, "_get_gateway_base_url", lambda: "http://gateway.test:8642")
+        monkeypatch.setattr(web_server, "_get_gateway_api_key", lambda: "gw-secret")
+        monkeypatch.setattr(web_server.httpx, "AsyncClient", _FakeAsyncClient)
+
+        resp = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-agent",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            },
+            headers={
+                "Authorization": f"Bearer {web_server._SESSION_TOKEN}",
+                "X-Hermes-Session-Id": "client-session-456",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["choices"][0]["message"]["content"] == "hello"
+        assert captured["url"] == "http://gateway.test:8642/v1/chat/completions"
+        assert captured["json"]["messages"][0]["content"] == "hello"
+        assert captured["headers"]["Authorization"] == "Bearer gw-secret"
+        assert captured["headers"]["X-Hermes-Session-Id"] == "client-session-456"
+        assert resp.headers["X-Hermes-Session-Id"] == "gw-session-123"
+
+    def test_chat_completions_proxy_streams_gateway_response(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        captured = {}
+
+        class _FakeStreamResponse:
+            status_code = 200
+            is_error = False
+            headers = {"X-Hermes-Session-Id": "gw-stream-789"}
+
+            async def aiter_bytes(self):
+                yield b'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n'
+                yield b'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n'
+                yield b'data: [DONE]\n\n'
+
+            async def aread(self):
+                return b""
+
+            async def aclose(self):
+                captured["stream_closed"] = True
+
+        class _FakeAsyncClient:
+            def __init__(self, *args, **kwargs):
+                captured["timeout"] = kwargs.get("timeout")
+
+            def build_request(self, method, url, json=None, headers=None):
+                captured["request"] = {
+                    "method": method,
+                    "url": url,
+                    "json": json,
+                    "headers": dict(headers or {}),
+                }
+                return object()
+
+            async def send(self, request, stream=False):
+                captured["stream"] = stream
+                return _FakeStreamResponse()
+
+            async def aclose(self):
+                captured["client_closed"] = True
+
+        monkeypatch.setattr(web_server, "_get_gateway_base_url", lambda: "http://gateway.test:8642")
+        monkeypatch.setattr(web_server, "_get_gateway_api_key", lambda: "gw-secret")
+        monkeypatch.setattr(web_server.httpx, "AsyncClient", _FakeAsyncClient)
+
+        with self.client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-agent",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            headers={"Authorization": f"Bearer {web_server._SESSION_TOKEN}"},
+        ) as resp:
+            body = b"".join(resp.iter_bytes())
+
+        assert resp.status_code == 200
+        assert resp.headers["x-hermes-session-id"] == "gw-stream-789"
+        assert captured["request"]["method"] == "POST"
+        assert captured["request"]["url"] == "http://gateway.test:8642/v1/chat/completions"
+        assert captured["request"]["headers"]["Authorization"] == "Bearer gw-secret"
+        assert captured["stream"] is True
+        assert b'"hel"' in body
+        assert b'"lo"' in body
+        assert captured["stream_closed"] is True
+        assert captured["client_closed"] is True
+
 
 # ---------------------------------------------------------------------------
 # _build_schema_from_config tests
